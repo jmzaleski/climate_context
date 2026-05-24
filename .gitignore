@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+/climate_context.png
+/climate_context_Golden_BC.csv
+/climate_context_Vancouver_BC.csv
