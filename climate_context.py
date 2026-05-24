@@ -7,19 +7,21 @@ ERA5 historical climatology for Golden BC and Vancouver BC.
 Layout per location: two panels side by side
   LEFT  — near term (today + NEAR_DAYS), tight auto-scale
   RIGHT — medium range (remaining days), outlier-clipped scale
-           with ⚠ annotations when a model runs wild
+           with ⚠ annotation showing peak exceedance per model only
+
+Also saves:  climate_context_<location>.csv  (wide format, one col per model)
 
 Requirements: pip install requests numpy pandas matplotlib
 """
 
 import datetime
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import matplotlib.patches as mpatches
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -42,17 +44,17 @@ MODEL_COLOURS = {
     "ICON (DWD)":   "#2A7BE0",
 }
 
-TIMEZONE           = "America/Vancouver"
-FORECAST_DAYS      = 10
-NEAR_DAYS          = 3      # days in the left "detail" panel (today + 2)
-ERA5_START_YEAR    = 1981
-ERA5_END_YEAR      = 2023
-CLIMATE_WINDOW     = 10     # ± days of year to pool for percentiles
-TIME_SLOTS         = [0, 6, 12, 18]
-MAX_WORKERS        = 8
-OUTLIER_THRESHOLD  = 5.0    # °C above ERA5 p90 → flag + clip on far panel
+TIMEZONE          = "America/Vancouver"
+FORECAST_DAYS     = 10
+NEAR_DAYS         = 3
+ERA5_START_YEAR   = 1981
+ERA5_END_YEAR     = 2023
+CLIMATE_WINDOW    = 10
+TIME_SLOTS        = [0, 6, 12, 18]
+MAX_WORKERS       = 8
+OUTLIER_THRESHOLD = 5.0   # °C above ERA5 p90 → flag + clip
 
-# ── API fetches (unchanged from previous version) ─────────────────────────────
+# ── API fetches ───────────────────────────────────────────────────────────────
 
 def fetch_forecast_hourly(lat, lon, model_id):
     r = requests.get("https://api.open-meteo.com/v1/forecast", params={
@@ -158,7 +160,7 @@ def fetch_era5_hourly_all(lat, lon):
     return df.sort_values("dt").reset_index(drop=True)
 
 
-# ── Stats helpers ─────────────────────────────────────────────────────────────
+# ── Stats ─────────────────────────────────────────────────────────────────────
 
 def pstats(vals):
     if len(vals) < 5:
@@ -187,20 +189,45 @@ def min_stats(era5m, date):
     return pstats(era5m.loc[doy_mask(era5m, date), "tmin"].values)
 
 
+# ── CSV export ────────────────────────────────────────────────────────────────
+
+def save_csv(loc_name, forecasts, era5h_df, era5_min_df, all_dates):
+    """
+    Wide-format CSV: datetime index, one column per forecast model,
+    plus ERA5 slot median and ERA5 daily-min median for context.
+    """
+    # Combine all forecast series into one DataFrame
+    fc_df = pd.DataFrame(forecasts)
+    fc_df.index.name = "datetime"
+
+    # ERA5 slot median at each forecast hour
+    era5_slot_col = []
+    for dt in fc_df.index:
+        st = slot_stats(era5h_df, dt.date(), dt.hour)
+        era5_slot_col.append(st["median"] if st else np.nan)
+    fc_df["ERA5_slot_median"] = era5_slot_col
+
+    # ERA5 daily min median (repeated across each day's rows)
+    era5_min_col = []
+    for dt in fc_df.index:
+        st = min_stats(era5_min_df, dt.date())
+        era5_min_col.append(st["median"] if st else np.nan)
+    fc_df["ERA5_daily_min_median"] = era5_min_col
+
+    safe_name = re.sub(r"[^a-zA-Z0-9]+", "_", loc_name).strip("_")
+    fname = f"climate_context_{safe_name}.csv"
+    fc_df.round(2).to_csv(fname)
+    print(f"  CSV → {fname}  ({len(fc_df)} rows × {len(fc_df.columns)} cols)")
+
+
 # ── Panel drawing ─────────────────────────────────────────────────────────────
 
 def draw_panel(ax, dates, forecasts, sunrise_df, era5_min_df, era5h_df,
                title, is_near, show_legend, show_ylabel):
-    """
-    Draw one panel (either near-term detail or medium-range).
-    Outlier clipping only applied when is_near=False.
-    """
-    # ── x limits ──
+
     x_min = pd.Timestamp(dates[0])
     x_max = pd.Timestamp(dates[-1]) + pd.Timedelta(hours=23)
     ax.set_xlim(x_min, x_max)
-
-    # Light background tint to distinguish near vs far
     ax.set_facecolor("#FFFDF5" if is_near else "#F5F8FF")
 
     # ── Sunrise shading ──
@@ -229,59 +256,74 @@ def draw_panel(ax, dates, forecasts, sunrise_df, era5_min_df, era5h_df,
                 ls="--", zorder=3, label="ERA5 slot median")
 
     # ── ERA5 daily minimum band ──
-    first = True
     era5_p90_by_day = {}
+    first = True
     for d in dates:
         st = min_stats(era5_min_df, d)
         if not st:
             continue
         era5_p90_by_day[d] = st["p90"]
-        d0, d1 = pd.Timestamp(d), pd.Timestamp(d) + pd.Timedelta(hours=23, minutes=59)
+        d0 = pd.Timestamp(d)
+        d1 = d0 + pd.Timedelta(hours=23, minutes=59)
         ax.fill_between([d0, d1], [st["p25"]] * 2, [st["p75"]] * 2,
                         color="#7EC8C8", alpha=0.40, zorder=2,
                         label="ERA5 daily min p25–p75" if first else "_nolegend_")
         ax.hlines(st["median"], d0, d1, colors="#1A8C8C", lw=1.2, ls=":",
-                  zorder=3, label="ERA5 daily min median" if first else "_nolegend_")
+                  zorder=3,
+                  label="ERA5 daily min median" if first else "_nolegend_")
         first = False
 
-    # ── Detect outliers (far panel only) ──
-    outlier_notes = []   # (model_name, date, value, excess)
+    # ── Outlier detection: ONE entry per model (peak exceedance only) ────────
     clip_top = None
     if not is_near and era5_p90_by_day:
+        model_peaks = {}   # model_name → (date, peak_val, excess)
         for model_name, series in forecasts.items():
             for d in dates:
-                day = series[series.index.date == d]
-                if day.empty:
-                    continue
                 p90 = era5_p90_by_day.get(d)
                 if p90 is None:
                     continue
-                max_val = day.max()
-                if max_val > p90 + OUTLIER_THRESHOLD:
-                    outlier_notes.append((model_name, d, max_val, max_val - p90))
+                day = series[series.index.date == d]
+                if day.empty:
+                    continue
+                excess = day.max() - p90
+                if excess > OUTLIER_THRESHOLD:
+                    if (model_name not in model_peaks
+                            or excess > model_peaks[model_name][2]):
+                        model_peaks[model_name] = (d, day.max(), excess)
 
-        if outlier_notes:
-            # Clip y-axis top at max ERA5 p90 + threshold + small buffer
-            max_p90 = max(era5_p90_by_day.values())
+        if model_peaks:
+            max_p90  = max(era5_p90_by_day.values())
             clip_top = max_p90 + OUTLIER_THRESHOLD + 3.0
 
-    # ── Forecast curves + daily minimum markers ──
+            # Build compact annotation — one line per model
+            lines = [f"⚠  Clipped (>{OUTLIER_THRESHOLD:.0f}° above ERA5 p90):"]
+            for model_name, (d, peak, excess) in sorted(
+                    model_peaks.items(), key=lambda x: -x[1][2]):
+                day_str = pd.Timestamp(d).strftime("%a %b %-d")
+                colour  = MODEL_COLOURS[model_name]
+                lines.append(
+                    f"  {model_name}: {peak:.1f}°C on {day_str} (+{excess:.1f}°)")
+
+            ax.text(0.02, 0.98, "\n".join(lines),
+                    transform=ax.transAxes,
+                    fontsize=7.5, color="#7B0000",
+                    va="top", ha="left", zorder=10,
+                    bbox=dict(facecolor="#FFF0F0", alpha=0.90,
+                              edgecolor="#CC4444", linewidth=0.8))
+
+    # ── Forecast curves + daily minimum markers ──────────────────────────────
     lw   = 2.0 if is_near else 1.5
     alph = 0.90 if is_near else 0.70
     for model_name, series in forecasts.items():
-        colour = MODEL_COLOURS[model_name]
-        # Clip series for display if outlier clipping is active
-        plot_vals = series.values.copy()
-        if clip_top is not None:
-            plot_vals = np.clip(plot_vals, None, clip_top + 2)
-
-        day_series = series[[d in dates for d in series.index.date]]
-        if day_series.empty:
+        colour   = MODEL_COLOURS[model_name]
+        day_mask = [d in dates for d in series.index.date]
+        seg      = series[day_mask]
+        if seg.empty:
             continue
 
-        ax.plot(day_series.index,
-                np.clip(day_series.values, None,
-                        clip_top + 2 if clip_top else np.inf),
+        plot_vals = (np.clip(seg.values, None, clip_top + 2)
+                     if clip_top is not None else seg.values)
+        ax.plot(seg.index, plot_vals,
                 color=colour, lw=lw, alpha=alph, zorder=5, label=model_name)
 
         for d in dates:
@@ -291,30 +333,13 @@ def draw_panel(ax, dates, forecasts, sunrise_df, era5_min_df, era5h_df,
             min_t  = day.min()
             min_dt = day.idxmin()
             ax.plot(min_dt, min_t, marker="v", ms=6 if is_near else 5,
-                    color=colour, zorder=6)
+                    color=colour, zorder=6, label="_nolegend_")
             ax.annotate(f"{min_t:.1f}°",
                         xy=(min_dt, min_t), xytext=(0, -13),
                         textcoords="offset points",
                         ha="center", fontsize=7, color=colour, zorder=7)
 
-    # ── Outlier annotations ──
-    if outlier_notes:
-        # Sort by date then excess
-        outlier_notes.sort(key=lambda x: (x[1], -x[3]))
-        lines = [f"⚠ Clipped outliers (>{OUTLIER_THRESHOLD:.0f}° above ERA5 p90):"]
-        for model_name, d, val, excess in outlier_notes:
-            day_str = pd.Timestamp(d).strftime("%a %b %-d")
-            lines.append(
-                f"  {model_name}: {val:.1f}°C on {day_str}  (+{excess:.1f}° above p90)")
-        note = "\n".join(lines)
-        ax.text(0.02, 0.98, note,
-                transform=ax.transAxes,
-                fontsize=7.5, color="#7B0000",
-                va="top", ha="left", zorder=10,
-                bbox=dict(facecolor="#FFF0F0", alpha=0.90,
-                          edgecolor="#CC4444", linewidth=0.8))
-
-    # ── Grid lines at day/6h boundaries ──
+    # ── Grid lines ──
     for d in dates:
         for h in range(24):
             dt = pd.Timestamp(d) + pd.Timedelta(hours=h)
@@ -325,10 +350,9 @@ def draw_panel(ax, dates, forecasts, sunrise_df, era5_min_df, era5h_df,
 
     # ── Apply y-axis clip ──
     if clip_top is not None:
-        current_bottom = ax.get_ylim()[0]
-        ax.set_ylim(bottom=current_bottom, top=clip_top)
+        ax.set_ylim(top=clip_top)
 
-    # ── Axes formatting ──
+    # ── Axes ──
     ax.set_title(title, fontsize=11, fontweight="bold", pad=18)
     if show_ylabel:
         ax.set_ylabel("Temperature (°C)", fontsize=10)
@@ -337,7 +361,7 @@ def draw_panel(ax, dates, forecasts, sunrise_df, era5_min_df, era5h_df,
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.tick_params(axis="x", labelsize=7.5)
 
-    # Top x: date labels at midnight
+    # Top x: date labels
     ax2 = ax.twiny()
     ax2.set_xlim(ax.get_xlim())
     ax2.set_xticks([mdates.date2num(pd.Timestamp(d)) for d in dates])
@@ -346,31 +370,34 @@ def draw_panel(ax, dates, forecasts, sunrise_df, era5_min_df, era5h_df,
     ax2.tick_params(length=0)
 
     ax.grid(axis="y", alpha=0.20)
+
     if show_legend:
-        ax.legend(loc="upper right", fontsize=7.5, framealpha=0.92)
+        # Build a clean, deduplicated legend
+        handles, labels = ax.get_legend_handles_labels()
+        seen = {}
+        for h, l in zip(handles, labels):
+            if l != "_nolegend_" and l not in seen:
+                seen[l] = h
+        ax.legend(seen.values(), seen.keys(),
+                  loc="upper right", fontsize=7.5, framealpha=0.92)
 
     ax.text(0.01, 0.02,
             "▼ = daily min   │   Yellow = sunrise ±45 min",
-            transform=ax.transAxes, fontsize=7, color="#666",
-            va="bottom",
+            transform=ax.transAxes, fontsize=7, color="#666", va="bottom",
             bbox=dict(facecolor="white", alpha=0.6, edgecolor="none"))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    today = datetime.date.today()
-    n     = len(LOCATIONS)
-
-    # 2-column layout per location: near (3 days) | far (remaining days)
-    # width_ratios proportional to day counts
+    today    = datetime.date.today()
+    n        = len(LOCATIONS)
     far_days = FORECAST_DAYS - NEAR_DAYS
+
     fig = plt.figure(figsize=(18, 7.5 * n))
-    gs  = fig.add_gridspec(
-        n, 2,
-        width_ratios=[NEAR_DAYS, far_days],
-        hspace=0.45, wspace=0.10,
-    )
+    gs  = fig.add_gridspec(n, 2,
+                           width_ratios=[NEAR_DAYS, far_days],
+                           hspace=0.45, wspace=0.10)
     fig.suptitle(
         f"Hourly Forecast vs. ERA5 Climatology  ·  {today}\n"
         f"LEFT: detail ({NEAR_DAYS} days, auto-scale)   "
@@ -382,7 +409,6 @@ def main():
         lat, lon = coords["lat"], coords["lon"]
         print(f"\n{'─'*60}\n  {loc_name}\n{'─'*60}")
 
-        # ── Fetch forecasts ──
         forecasts = {}
         for model_name, model_id in FORECAST_MODELS.items():
             print(f"  {model_name} …", end=" ", flush=True)
@@ -395,7 +421,6 @@ def main():
         if not forecasts:
             continue
 
-        # ── Sunrise ──
         print("  Sunrise/sunset …", end=" ", flush=True)
         try:
             sunrise_df = fetch_sunrise_sunset(lat, lon)
@@ -404,7 +429,6 @@ def main():
             print(f"✗  {e}")
             sunrise_df = pd.DataFrame(columns=["date", "sunrise", "sunset"])
 
-        # ── ERA5 ──
         print(f"  ERA5 daily min …", end=" ", flush=True)
         era5_min = fetch_era5_daily_min(lat, lon)
         print(f"✓  ({len(era5_min):,} rows)")
@@ -413,29 +437,29 @@ def main():
         era5h = fetch_era5_hourly_all(lat, lon)
         print(f"✓  ({len(era5h):,} rows)")
 
-        # ── Split dates ──
-        all_dates = sorted({dt.date() for s in forecasts.values() for dt in s.index})
+        all_dates  = sorted({dt.date() for s in forecasts.values() for dt in s.index})
         near_dates = all_dates[:NEAR_DAYS]
         far_dates  = all_dates[NEAR_DAYS:]
 
-        # ── Draw panels ──
+        # ── CSV ──
+        save_csv(loc_name, forecasts, era5h, era5_min, all_dates)
+
+        # ── Panels ──
         ax_near = fig.add_subplot(gs[row, 0])
         ax_far  = fig.add_subplot(gs[row, 1])
 
-        draw_panel(ax_near, near_dates, forecasts, sunrise_df,
-                   era5_min, era5h,
+        draw_panel(ax_near, near_dates, forecasts, sunrise_df, era5_min, era5h,
                    title=f"{loc_name}  —  Detail",
                    is_near=True, show_legend=True, show_ylabel=True)
 
-        draw_panel(ax_far, far_dates, forecasts, sunrise_df,
-                   era5_min, era5h,
+        draw_panel(ax_far, far_dates, forecasts, sunrise_df, era5_min, era5h,
                    title="Medium range",
                    is_near=False, show_legend=False, show_ylabel=False)
 
     plt.tight_layout()
     out = "climate_context.png"
     plt.savefig(out, dpi=150, bbox_inches="tight")
-    print(f"\n✓  Saved → {out}")
+    print(f"\n✓  Chart → {out}")
     plt.show()
 
 
