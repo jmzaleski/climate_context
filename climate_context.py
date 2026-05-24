@@ -450,11 +450,11 @@ def main():
 
         draw_panel(ax_near, near_dates, forecasts, sunrise_df, era5_min, era5h,
                    title=f"{loc_name}  —  Detail",
-                   is_near=True, show_legend=True, show_ylabel=True)
+                   is_near=True, show_legend=False, show_ylabel=True)
 
         draw_panel(ax_far, far_dates, forecasts, sunrise_df, era5_min, era5h,
                    title="Medium range",
-                   is_near=False, show_legend=False, show_ylabel=False)
+                   is_near=False, show_legend=True, show_ylabel=False)
 
     plt.tight_layout()
     out = "climate_context.png"
