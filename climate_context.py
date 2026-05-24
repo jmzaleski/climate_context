@@ -46,7 +46,7 @@ MODEL_COLOURS = {
 
 TIMEZONE          = "America/Vancouver"
 FORECAST_DAYS     = 10
-NEAR_DAYS         = 3
+NEAR_DAYS         = 2
 ERA5_START_YEAR   = 1981
 ERA5_END_YEAR     = 2023
 CLIMATE_WINDOW    = 10
@@ -394,7 +394,7 @@ def main():
     n        = len(LOCATIONS)
     far_days = FORECAST_DAYS - NEAR_DAYS
 
-    fig = plt.figure(figsize=(18, 7.5 * n))
+    fig = plt.figure(figsize=(18, 5.2 * n))
     gs  = fig.add_gridspec(n, 2,
                            width_ratios=[NEAR_DAYS, far_days],
                            hspace=0.45, wspace=0.10)
